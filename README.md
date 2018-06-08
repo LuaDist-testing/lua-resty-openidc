@@ -3,7 +3,7 @@
 # lua-resty-openidc
 
 **lua-resty-openidc** is a library for [NGINX](http://nginx.org/) implementing the
-[OpenID Connect] (http://openid.net/specs/openid-connect-core-1_0.html) Relying Party (RP)
+[OpenID Connect](http://openid.net/specs/openid-connect-core-1_0.html) Relying Party (RP)
 and the [OAuth 2.0](https://tools.ietf.org/html/rfc6749) Resource Server (RS) functionality.
 
 When used as an OpenID Connect Relying Party it authenticates users against an OpenID Connect
@@ -97,11 +97,22 @@ http {
              client_secret = "<client_secret>"
              --authorization_params = { hd="pingidentity.com" },
              --scope = "openid email profile",
+             -- Refresh the user's id_token after 900 seconds without requiring re-authentication
+             --refresh_session_interval = 900,
              --iat_slack = 600,
              --redirect_uri_scheme = "https",
              --logout_path = "/logout",
+             --redirect_after_logout_uri = "/",
              --token_endpoint_auth_method = ["client_secret_basic"|"client_secret_post"],
              --ssl_verify = "no"
+             --access_token_expires_in = 3600
+             -- Default lifetime in seconds of the access_token if no expires_in attribute is present in the token 
+                endpoint response.
+                This plugin will silently renew the access_token once it's expired if refreshToken scope is present.
+             --access_token_expires_leeway = 0
+                Expiration leeway for access_token renewal.
+                If this is set, renewal will happen access_token_expires_leeway seconds before the token expiration.
+                This avoids errors in case the access_token just expires when arriving to the OAuth Resoource Server.
           }
 
           -- call authenticate for OpenID Connect user authentication
@@ -134,6 +145,13 @@ http {
     }
   }
 }
+```
+
+## Check authentication only
+
+```
+-- check session, but do not redirect to auth if not already logged in
+local res, err = require("resty.openidc").authenticate(opts, nil, "pass")
 ```
 
 ## Sample Configuration for OAuth 2.0 JWT Token Validation
