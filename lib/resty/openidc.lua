@@ -65,7 +65,7 @@ local supported_token_auth_methods = {
 }
 
 local openidc = {
-  _VERSION = "1.5.2"
+  _VERSION = "1.5.3"
 }
 openidc.__index = openidc
 
@@ -126,8 +126,8 @@ local function openidc_validate_id_token(opts, id_token, nonce)
   end
 
   local slack=opts.iat_slack and opts.iat_slack or 120
-  if id_token.iat < (ngx.time() - slack) then
-    ngx.log(ngx.ERR, "token has been issued too long ago: id_token.iat=", id_token.iat, ", ngx.time()=", ngx.time())
+  if id_token.iat > (ngx.time() + slack) then
+    ngx.log(ngx.ERR, "id_token not yet valid: id_token.iat=", id_token.iat, ", ngx.time()=", ngx.time(), ", slack=", slack)
     return false
   end
 
@@ -165,14 +165,72 @@ local function openidc_validate_id_token(opts, id_token, nonce)
   return true
 end
 
+local function get_first_header(header_name)
+  local header = ngx.req.get_headers()[header_name]
+  if header and type(header) == 'table' then
+    header = header[1]
+  end
+  return header
+end
+
+local function get_first_header_and_strip_whitespace(header_name)
+  local header = get_first_header(header_name)
+  return header and header:gsub('%s', '')
+end
+
+local function get_forwarded_parameter(param_name)
+  local forwarded = get_first_header("Forwarded")
+  local params = {}
+  if forwarded then
+    local function parse_parameter(pv)
+      local name, value = pv:match("^%s*([^=]+)%s*=%s*(.-)%s*$")
+      if name and value then
+        if value:sub(1, 1) == '"' then
+          value = value:sub(2, -2)
+        end
+        params[name:lower()] = value
+      end
+    end
+    -- this assumes there is no quoted comma inside the header's value
+    -- which should be fine as comma is not legal inside a node name,
+    -- a URI scheme or a host name. The only thing that might bite us
+    -- are extensions.
+    local first_part = forwarded
+    local first_comma = forwarded:find("%s*,%s*")
+    if first_comma then
+      first_part = forwarded:sub(1, first_comma - 1)
+    end
+    first_part:gsub("[^;]+", parse_parameter)
+  end
+  return params[param_name:gsub("^%s*(.-)%s*$", "%1"):lower()]
+end
+
+local function get_scheme()
+  return get_forwarded_parameter("proto")
+    or get_first_header_and_strip_whitespace('X-Forwarded-Proto')
+    or ngx.var.scheme
+end
+
+local function get_host_name_from_x_header()
+  local header = get_first_header_and_strip_whitespace('X-Forwarded-Host')
+  return header and header:gsub('^([^,]+),?.*$', '%1')
+end
+
+local function get_host_name()
+  return get_forwarded_parameter("host")
+    or get_host_name_from_x_header()
+    or ngx.var.http_host
+end
+
 -- assemble the redirect_uri
 local function openidc_get_redirect_uri(opts)
-  local scheme = opts.redirect_uri_scheme or ngx.req.get_headers()['X-Forwarded-Proto'] or ngx.var.scheme
-  if not ngx.var.http_host then
+  local scheme = opts.redirect_uri_scheme or get_scheme()
+  local host = get_host_name()
+  if not host then
     -- possibly HTTP 1.0 and no Host header
     ngx.exit(ngx.HTTP_BAD_REQUEST)
   end
-  return scheme.."://"..ngx.var.http_host ..opts.redirect_uri_path
+  return scheme.."://"..host..opts.redirect_uri_path
 end
 
 -- perform base64url decoding
@@ -269,6 +327,16 @@ local function openidc_configure_timeouts(httpc, timeout)
   end
 end
 
+-- Set outgoing proxy options
+local function openidc_configure_proxy(httpc, proxy_opts)
+    if httpc and proxy_opts and type(proxy_opts) == "table"  then
+        ngx.log(ngx.DEBUG, "openidc_configure_proxy : use http proxy")
+        httpc:set_proxy_options(proxy_opts)
+    else
+        ngx.log(ngx.DEBUG, "openidc_configure_proxy : don't use http proxy")
+    end
+end
+
 -- make a call to the token endpoint
 local function openidc_call_token_endpoint(opts, endpoint, body, auth, endpoint_name)
 
@@ -293,6 +361,7 @@ local function openidc_call_token_endpoint(opts, endpoint, body, auth, endpoint_
 
   local httpc = http.new()
   openidc_configure_timeouts(httpc, opts.timeout)
+  openidc_configure_proxy(httpc, opts.proxy_opts)
   local res, err = httpc:request_uri(endpoint, {
     method = "POST",
     body = ngx.encode_args(body),
@@ -325,6 +394,7 @@ local function openidc_call_userinfo_endpoint(opts, access_token)
 
   local httpc = http.new()
   openidc_configure_timeouts(httpc, opts.timeout)
+  openidc_configure_proxy(httpc, opts.proxy_opts)
   local res, err = httpc:request_uri(opts.discovery.userinfo_endpoint, {
     headers = headers,
     ssl_verify = (opts.ssl_verify ~= "no")
@@ -362,7 +432,7 @@ local function openidc_load_jwt_none_alg(enc_hdr, enc_payload)
 end
 
 -- get the Discovery metadata from the specified URL
-local function openidc_discover(url, ssl_verify, timeout)
+local function openidc_discover(url, ssl_verify, timeout, proxy_opts)
   ngx.log(ngx.DEBUG, "openidc_discover: URL is: "..url)
 
   local json, err
@@ -373,6 +443,7 @@ local function openidc_discover(url, ssl_verify, timeout)
     -- make the call to the discovery endpoint
     local httpc = http.new()
     openidc_configure_timeouts(httpc, timeout)
+    openidc_configure_proxy(httpc, proxy_opts)
     local res, error = httpc:request_uri(url, {
       ssl_verify = (ssl_verify ~= "no")
     })
@@ -407,12 +478,12 @@ end
 local function openidc_ensure_discovered_data(opts)
   local err
   if type(opts.discovery) == "string" then
-    opts.discovery, err = openidc_discover(opts.discovery, opts.ssl_verify, opts.timeout)
+    opts.discovery, err = openidc_discover(opts.discovery, opts.ssl_verify, opts.timeout, opts.proxy_opts)
   end
   return err
 end
 
-local function openidc_jwks(url, force, ssl_verify, timeout)
+local function openidc_jwks(url, force, ssl_verify, timeout, proxy_opts)
   ngx.log(ngx.DEBUG, "openidc_jwks: URL is: "..url.. " (force=" .. force .. ")")
 
   local json, err, v
@@ -427,6 +498,7 @@ local function openidc_jwks(url, force, ssl_verify, timeout)
     -- make the call to the jwks endpoint
     local httpc = http.new()
     openidc_configure_timeouts(httpc, timeout)
+    openidc_configure_proxy(httpc, proxy_opts)
     local res, error = httpc:request_uri(url, {
       ssl_verify = (ssl_verify ~= "no")
     })
@@ -583,7 +655,7 @@ local function openidc_pem_from_jwk(opts, kid)
   local jwk, jwks
 
   for force=0, 1 do
-    jwks, err = openidc_jwks(opts.discovery.jwks_uri, force, opts.ssl_verify, opts.timeout)
+    jwks, err = openidc_jwks(opts.discovery.jwks_uri, force, opts.ssl_verify, opts.timeout, opts.proxy_opts)
     if err then
       return nil, err
     end
@@ -1005,6 +1077,16 @@ function openidc.authenticate(opts, target_url, unauth_action, session_opts)
       token_expired = true
     end
   end
+
+  ngx.log(ngx.DEBUG,
+    "session.present=", session.present,
+    ", session.data.id_token=", session.data.id_token ~= nil,
+    ", session.data.authenticated=", session.data.authenticated,
+    ", opts.force_reauthorize=", opts.force_reauthorize,
+    ", opts.renew_access_token_on_expiry=", opts.renew_access_token_on_expiry,
+    ", try_to_renew=", try_to_renew,
+    ", token_expired=", token_expired
+  )
 
   -- if we are not authenticated then redirect to the OP for authentication
   -- the presence of the id_token is check for backwards compatibility
