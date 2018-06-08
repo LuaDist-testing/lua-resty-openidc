@@ -118,7 +118,7 @@ http {
           --  ngx.exit(ngx.HTTP_FORBIDDEN)
           --end
 
-          --if res.user.email ~= "hzandbelt@pingidentity.com" then
+          --if res.user.email ~= "hans.zandbelt@zmartzone.eu" then
           --  ngx.exit(ngx.HTTP_FORBIDDEN)
           --end
 
@@ -177,6 +177,66 @@ OcTuruRhqYOIJjiYZSgK/P0zUw1cjLwUJ9ig/O6ozYmof83974fygA/wK3SgFNEoFlTkTpOvZhVW
 9kLfCVA/CRBfJNKnz5PWBBxd/3XSEuP/fcWqKGTy7zZso4MTB0NKgWO4duGTgMyZbM4onJPyA0CY
 lAc5Csj0o5Q+oEhPUAVBIF07m4rd0OvAVPOCQ2NJhQSL1oWASbf+fg==
 -----END CERTIFICATE-----]]
+          }
+
+          -- call bearer_jwt_verify for OAuth 2.0 JWT validation
+          local res, err = require("resty.openidc").bearer_jwt_verify(opts)
+
+           if err or not res then
+            ngx.status = 403
+            ngx.say(err and err or "no access_token provided")
+            ngx.exit(ngx.HTTP_FORBIDDEN)
+          end
+          
+          -- at this point res is a Lua table that represents the JSON
+          -- payload in the JWT token 
+          
+          --if res.scope ~= "edit" then
+          --  ngx.exit(ngx.HTTP_FORBIDDEN)
+          --end
+
+          --if res.client_id ~= "ro_client" then
+          --  ngx.exit(ngx.HTTP_FORBIDDEN)
+          --end          
+      ';
+
+       proxy_pass http://localhost:80;     
+    }
+  }
+}
+```
+
+## Sample Configuration for OAuth 2.0 JWT Token Validation
+
+Sample `nginx.conf` configuration for verifying Bearer JWT Access Tokens against a OpenID Connect Discovery endpoint.
+Once successfully verified, the NGINX server may function as a reverse proxy to an internal origin server.
+
+```
+events {
+  worker_connections 128;
+}
+
+http {
+
+  lua_package_path '~/lua/?.lua;;';
+
+  resolver 8.8.8.8;
+  
+  # cache for JWT verification results
+  lua_shared_dict introspection 10m;
+  # cache for jwks metadata documents
+  lua_shared_dict discovery 1m;
+ 
+  server {
+    listen 8080;
+
+    location /api {
+
+      access_by_lua '
+ 
+          local opts = {
+            -- The jwks endpoint must provide a x5c entry 
+            -- discovery = "https://accounts.google.com/.well-known/openid-configuration", 
           }
 
           -- call bearer_jwt_verify for OAuth 2.0 JWT validation
@@ -270,9 +330,19 @@ http {
 }
 ```
 
-## Disclaimer
+## Support
+
+See the Wiki pages with Frequently Asked Questions at:  
+  https://github.com/pingidentity/lua-resty-openidc/wiki  
+For commercial support and consultancy you can contact:  
+  [info@zmartzone.eu](mailto:info@zmartzone.eu)  
+
+Any questions/issues should go to issues tracker or the primary author
+[hans.zandbelt@zmartzone.eu](mailto:hans.zandbelt@zmartzone.eu)
+
+Disclaimer
+----------
 
 *This software is open sourced by Ping Identity but not supported commercially
-as such. Any questions/issues should go to the Github issues
-tracker or the author [hzandbelt@pingidentity.com](mailto:hzandbelt@pingidentity.com)
-directly See also the DISCLAIMER file in this directory.*
+by Ping Identity, see also the DISCLAIMER file in this directory. For commercial support
+you can contact [ZmartZone IAM](https://www.zmartzone.eu) as described above.*

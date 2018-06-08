@@ -1,18 +1,10 @@
--- This file was automatically generated for the LuaDist project.
-
 package = "lua-resty-openidc"
-version = "1.2.3-1"
--- LuaDist source
+version = "1.3.0-1"
 source = {
-  tag = "1.2.3-1",
-  url = "git://github.com/LuaDist-testing/lua-resty-openidc.git"
+    url = "git://github.com/pingidentity/lua-resty-openidc",
+    tag = "v1.3.0",
+    dir = "lua-resty-openidc"
 }
--- Original source
--- source = {
---     url = "git://github.com/pingidentity/lua-resty-openidc",
---     tag = "v1.2.3",
---     dir = "lua-resty-openidc"
--- }
 description = {
     summary = "A library for NGINX implementing the OpenID Connect Relying Party (RP) and the OAuth 2.0 Resource Server (RS) functionality",
     detailed = [[
