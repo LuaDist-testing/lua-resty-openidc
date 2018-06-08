@@ -56,10 +56,24 @@ local pairs   = pairs
 local type    = type
 local ngx     = ngx
 
+local supported_token_auth_methods = {
+   client_secret_basic = true,
+   client_secret_post = true
+}
+
 local openidc = {
-  _VERSION = "1.4.0"
+  _VERSION = "1.4.1"
 }
 openidc.__index = openidc
+
+local function store_in_session(opts, feature)
+  -- We don't have a whitelist of features to enable
+  if not opts.session_contents then
+    return true
+  end
+
+  return opts.session_contents[feature]
+end
 
 -- set value in server-wide cache if available
 local function openidc_cache_set(type, key, value, exp)
@@ -136,7 +150,11 @@ end
 -- assemble the redirect_uri
 local function openidc_get_redirect_uri(opts)
   local scheme = opts.redirect_uri_scheme or ngx.req.get_headers()['X-Forwarded-Proto'] or ngx.var.scheme
-  return scheme.."://"..ngx.var.http_host..opts.redirect_uri_path
+  if not ngx.var.http_host then
+    -- possibly HTTP 1.0 and no Host header
+    ngx.exit(ngx.HTTP_BAD_REQUEST)
+  end
+  return scheme.."://"..ngx.var.http_host ..opts.redirect_uri_path
 end
 
 -- perform base64url decoding
@@ -173,8 +191,15 @@ local function openidc_authorize(opts, session, target_url)
     redirect_uri=openidc_get_redirect_uri(opts),
     state=state,
     nonce=nonce,
-    prompt=opts.prompt and opts.prompt or ""
   }
+
+  if opts.prompt then
+    params.prompt = opts.prompt  
+  end
+
+  if opts.display then
+    params.display = opts.display  
+  end
 
   -- merge any provided extra parameters
   if opts.authorization_params then
@@ -341,19 +366,34 @@ local function openidc_authorization_response(opts, session)
     return nil, err, session.data.original_url, session
   end
 
-  -- call the user info endpoint
-  -- TODO: should this error be checked?
-  local user, err = openidc_call_userinfo_endpoint(opts, json.access_token)
-
   session:start()
-  session.data.user = user
-  session.data.id_token = id_token
-  session.data.enc_id_token = json.id_token
-  session.data.access_token = json.access_token
-  session.data.access_token_expiration = current_time
-          + openidc_access_token_expires_in(opts, json.expires_in)
-  if json.refresh_token ~= nil then
-    session.data.refresh_token = json.refresh_token
+  -- mark this sessions as authenticated
+  session.data.authenticated = true
+  -- clear state and nonce to protect against potential misuse
+  session.data.nonce = nil
+  session.data.state = nil
+  if store_in_session(opts, 'id_token') then
+    session.data.id_token = id_token
+  end
+
+  if store_in_session(opts, 'user') then
+    -- call the user info endpoint
+    -- TODO: should this error be checked?
+    local user, err = openidc_call_userinfo_endpoint(opts, json.access_token)
+    session.data.user = user
+  end
+
+  if store_in_session(opts, 'enc_id_token') then
+    session.data.enc_id_token = json.id_token
+  end
+
+  if store_in_session(opts, 'access_token') then
+    session.data.access_token = json.access_token
+    session.data.access_token_expiration = current_time
+            + openidc_access_token_expires_in(opts, json.expires_in)
+    if json.refresh_token ~= nil then
+      session.data.refresh_token = json.refresh_token
+    end
   end
 
   -- save the session with the obtained id_token
@@ -514,6 +554,11 @@ end
 -- get the token endpoint authentication method
 local function openidc_get_token_auth_method(opts)
 
+  if opts.token_endpoint_auth_method ~= nil and not supported_token_auth_methods[opts.token_endpoint_auth_method] then
+    ngx.log(ngx.ERR, "configured value for token_endpoint_auth_method ("..opts.token_endpoint_auth_method..") is not supported, ignoring it")
+    opts.token_endpoint_auth_method = nil
+  end
+
   local result
   if opts.discovery.token_endpoint_auth_methods_supported ~= nil then
     -- if set check to make sure the discovery data includes the selected client auth method
@@ -531,8 +576,14 @@ local function openidc_get_token_auth_method(opts)
         return nil
       end
     else
-      result = opts.discovery.token_endpoint_auth_methods_supported[1]
-      ngx.log(ngx.DEBUG, "no configuration setting for option so select the first method specified by the OP: "..result)
+      for index, value in ipairs (opts.discovery.token_endpoint_auth_methods_supported) do
+        ngx.log(ngx.DEBUG, index.." => "..value)
+        if supported_token_auth_methods[value] then
+          result = value
+          ngx.log(ngx.DEBUG, "no configuration setting for option so select the first supported method specified by the OP: "..result)
+          break
+        end
+      end
     end
   else
     result = opts.token_endpoint_auth_method
@@ -646,8 +697,9 @@ function openidc.authenticate(opts, target_url, unauth_action, session_opts)
     return nil, nil, target_url, session
   end
 
-  -- if we have no id_token then redirect to the OP for authentication
-  if not session.present or not session.data.id_token or opts.force_reauthorize then
+  -- if we are not authenticated then redirect to the OP for authentication
+  -- the presence of the id_token is check for backwards compatibility
+  if not session.present or not (session.data.id_token or session.data.authenticated) or opts.force_reauthorize then
     if unauth_action == "pass" then
       return
         nil,
@@ -668,14 +720,18 @@ function openidc.authenticate(opts, target_url, unauth_action, session_opts)
     end
   end
 
-  -- refresh access_token if necessary
-  access_token, err = openidc_access_token(opts, session)
-  if err then
-    return nil, err, target_url, session
+  if store_in_session(opts, 'access_token') then
+    -- refresh access_token if necessary
+    access_token, err = openidc_access_token(opts, session)
+    if err then
+      return nil, err, target_url, session
+    end
   end
 
-  -- log id_token contents
-  ngx.log(ngx.DEBUG, "id_token=", cjson.encode(session.data.id_token))
+  if store_in_session(opts, 'id_token') then
+    -- log id_token contents
+    ngx.log(ngx.DEBUG, "id_token=", cjson.encode(session.data.id_token))
+  end
 
   -- return the id_token to the caller Lua script for access control purposes
   return
