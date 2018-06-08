@@ -65,7 +65,7 @@ local supported_token_auth_methods = {
 }
 
 local openidc = {
-  _VERSION = "1.5.4"
+  _VERSION = "1.6.0"
 }
 openidc.__index = openidc
 
@@ -310,6 +310,7 @@ local function openidc_authorize(opts, session, target_url, prompt)
   session:save()
 
   -- redirect to the /authorization endpoint
+  ngx.header["Cache-Control"] = "no-cache, no-store, max-age=0"
   return ngx.redirect(openidc_combine_uri(opts.discovery.authorization_endpoint, params))
 end
 
@@ -374,21 +375,20 @@ local function openidc_call_token_endpoint(opts, endpoint, body, auth, endpoint_
     end
   end
 
-  local pass_cookies = opts.pass_cookies or nil
-  if pass_cookies ~= nil then 
-    local cookies = ngx.req.get_headers()["Cookie"]	
-    if cookies ~= nil then 
+  local pass_cookies = opts.pass_cookies
+  if pass_cookies then
+    if ngx.req.get_headers()["Cookie"] then
       local t = {}
       for cookie_name in string.gmatch(pass_cookies, "%S+") do
-	local cookie_value = ngx.var["cookie_"..cookie_name]
-        if cookie_value ~= nil then 
+        local cookie_value = ngx.var["cookie_"..cookie_name]
+        if cookie_value then
           table.insert(t, cookie_name.."="..cookie_value)
         end
       end
       headers.Cookie = table.concat(t, "; ")
     end
-  end 
-  
+  end
+
   ngx.log(ngx.DEBUG, "request body for "..ep_name.." endpoint call: ", ngx.encode_args(body))
 
   local httpc = http.new()
@@ -681,11 +681,11 @@ local function openidc_pem_from_jwk(opts, kid)
   if err then
     return nil, err
   end
-  
+
   if not opts.discovery.jwks_uri or not (type(opts.discovery.jwks_uri) == "string") or (opts.discovery.jwks_uri == "") then
     return nil, "opts.discovery.jwks_uri is not present or not a string"
   end
-  
+
   local cache_id = opts.discovery.jwks_uri .. '#' .. (kid or '')
   local v = openidc_cache_get("jwks", cache_id)
 
@@ -830,6 +830,51 @@ local function openidc_load_jwt_and_verify_crypto(opts, jwt_string, asymmetric_s
   return jwt_obj
 end
 
+--
+-- Load and validate id token from the id_token properties of the token endpoint response
+-- Parameters :
+--     - opts the openidc module options
+--     - jwt_id_token the id_token from the id_token properties of the token endpoint response
+--     - session the current session
+-- Return the id_token, nil if valid
+-- Return nil, the error if invalid
+--
+local function openidc_load_and_validate_jwt_id_token(opts, jwt_id_token, session)
+
+  local jwt_obj, err = openidc_load_jwt_and_verify_crypto(opts, jwt_id_token, opts.secret, opts.client_secret,
+          opts.discovery.id_token_signing_alg_values_supported)
+  if err then
+    local alg = (jwt_obj and jwt_obj.header and jwt_obj.header.alg) or ''
+    local is_unsupported_signature_error = jwt_obj and not jwt_obj.verified and not is_algorithm_supported(jwt_obj.header)
+    if is_unsupported_signature_error then
+      if opts.accept_unsupported_alg == nil or opts.accept_unsupported_alg then
+        ngx.log(ngx.WARN, "ignored id_token signature as algorithm '" .. alg .. "' is not supported")
+      else
+        err = "token is signed using algorithm \"" .. alg .. "\" which is not supported by lua-resty-jwt"
+        ngx.log(ngx.ERR, err)
+        return nil, err
+      end
+    else
+      ngx.log(ngx.ERR, "id_token '" .. alg .. "' signature verification failed")
+      return nil, err
+    end
+  end
+  local id_token = jwt_obj.payload
+
+  ngx.log(ngx.DEBUG, "id_token header: ", cjson.encode(jwt_obj.header))
+  ngx.log(ngx.DEBUG, "id_token payload: ", cjson.encode(jwt_obj.payload))
+
+  -- validate the id_token contents
+  if openidc_validate_id_token(opts, id_token, session.data.nonce) == false then
+    err = "id_token validation failed"
+    ngx.log(ngx.ERR, err)
+    return nil, err
+  end
+
+  return id_token
+
+end
+
 -- handle a "code" authorization response from the OP
 local function openidc_authorization_response(opts, session)
   local args = ngx.req.get_uri_args()
@@ -880,34 +925,8 @@ local function openidc_authorization_response(opts, session)
     return nil, err, session.data.original_url, session
   end
 
-  local jwt_obj
-  jwt_obj, err = openidc_load_jwt_and_verify_crypto(opts, json.id_token, opts.secret, opts.client_secret,
-      opts.discovery.id_token_signing_alg_values_supported)
+  local id_token, err = openidc_load_and_validate_jwt_id_token(opts, json.id_token, session);
   if err then
-    local alg = (jwt_obj and jwt_obj.header and jwt_obj.header.alg) or ''
-    local is_unsupported_signature_error = jwt_obj and not jwt_obj.verified and not is_algorithm_supported(jwt_obj.header)
-    if is_unsupported_signature_error then
-      if opts.accept_unsupported_alg == nil or opts.accept_unsupported_alg then
-        ngx.log(ngx.WARN, "ignored id_token signature as algorithm '" .. alg .. "' is not supported")
-      else
-        err = "token is signed using algorithm \"" .. alg .. "\" which is not supported by lua-resty-jwt"
-        ngx.log(ngx.ERR, err)
-        return nil, err, session.data.original_url, session
-      end
-    else
-      ngx.log(ngx.ERR, "id_token '" .. alg .. "' signature verification failed")
-      return nil, err, session.data.original_url, session
-    end
-  end
-  local id_token = jwt_obj.payload
-
-  ngx.log(ngx.DEBUG, "id_token header: ", cjson.encode(jwt_obj.header))
-  ngx.log(ngx.DEBUG, "id_token payload: ", cjson.encode(jwt_obj.payload))
-
-  -- validate the id_token contents
-  if openidc_validate_id_token(opts, id_token, session.data.nonce) == false then
-    err = "id_token validation failed"
-    ngx.log(ngx.ERR, err)
     return nil, err, session.data.original_url, session
   end
 
@@ -1090,16 +1109,35 @@ local function openidc_access_token(opts, session, try_to_renew)
   if err then
     return nil, err
   end
+  local id_token
+  if json.id_token then
+    id_token, err = openidc_load_and_validate_jwt_id_token(opts, json.id_token, session)
+    if err then
+      ngx.log(ngx.ERR, "invalid id token, discarding tokens returned while refreshing")
+      return nil, err
+    end
+  end
   ngx.log(ngx.DEBUG, "access_token refreshed: ", json.access_token, " updated refresh_token: ", json.refresh_token)
 
   session:start()
   session.data.access_token = json.access_token
   session.data.access_token_expiration = current_time + openidc_access_token_expires_in(opts, json.expires_in)
-  if json.refresh_token ~= nil then
+  if json.refresh_token then
     session.data.refresh_token = json.refresh_token
   end
 
-  -- save the session with the new access_token and optionally the new refresh_token
+  if json.id_token and
+    (store_in_session(opts, 'enc_id_token') or store_in_session(opts, 'id_token')) then
+    ngx.log(ngx.DEBUG, "id_token refreshed: ", json.id_token)
+    if store_in_session(opts, 'enc_id_token') then
+      session.data.enc_id_token = json.id_token
+    end
+    if store_in_session(opts, 'id_token') then
+      session.data.id_token = id_token
+    end
+  end
+
+  -- save the session with the new access_token and optionally the new refresh_token and id_token
   session:save()
 
   return session.data.access_token, err
@@ -1230,45 +1268,35 @@ end
 
 -- get an OAuth 2.0 bearer access token from the HTTP request cookies
 local function openidc_get_bearer_access_token_from_cookie(opts)
-  
+
   local err
 
   ngx.log(ngx.DEBUG, "getting bearer access token from Cookie")
 
   local accept_token_as = opts.auth_accept_token_as or "header"
-
-  local default_cookie_name = "PA.global"
-  local cookie_name 
-
-  local divider = accept_token_as:find(':') 
-
-  if divider ~= nil then 
-    cookie_name = accept_token_as:sub(divider+1)
+  if accept_token_as:find("cookie") ~= 1 then
+    return nul, "openidc_get_bearer_access_token_from_cookie called but auth_accept_token_as wants "
+      .. opts.auth_accept_token_as
   end
-  
-  if cookie_name == nil then 
-    cookie_name = default_cookie_name
-  end
+  local divider = accept_token_as:find(':')
+  local cookie_name = divider and accept_token_as:sub(divider+1) or "PA.global"
 
   ngx.log(ngx.DEBUG, "bearer access token from cookie named: "..cookie_name)
 
-  local cookies = ngx.req.get_headers()["Cookie"]	
-
-  if cookies == nil then 
+  local cookies = ngx.req.get_headers()["Cookie"]
+  if not cookies then
     err = "no Cookie header found"
     ngx.log(ngx.ERR, err)
     return nil, err
-  end 
-  
+  end
+
   local cookie_value = ngx.var["cookie_"..cookie_name]
-  if cookie_value == nil then 
+  if not cookie_value then
     err = "no Cookie "..cookie_name.." found"
     ngx.log(ngx.ERR, err)
-    
   end
 
   return cookie_value, err
-
 end
 
 
@@ -1279,9 +1307,9 @@ local function openidc_get_bearer_access_token(opts)
 
   local accept_token_as = opts.auth_accept_token_as or "header"
 
-  if accept_token_as:find("cookie") ~= nil then 
+  if accept_token_as:find("cookie") == 1 then
     return openidc_get_bearer_access_token_from_cookie(opts)
-  end 
+  end
 
   -- get the access token from the Authorization header
   local headers = ngx.req.get_headers()
