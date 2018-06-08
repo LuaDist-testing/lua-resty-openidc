@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "lua-resty-openidc"
-version = "1.5.1-1"
+version = "1.5.2-1"
 -- LuaDist source
 source = {
-  tag = "1.5.1-1",
+  tag = "1.5.2-1",
   url = "git://github.com/LuaDist-testing/lua-resty-openidc.git"
 }
 -- Original source
 -- source = {
 --     url = "git://github.com/zmartzone/lua-resty-openidc",
---     tag = "v1.5.1",
+--     tag = "v1.5.2",
 --     dir = "lua-resty-openidc"
 -- }
 description = {

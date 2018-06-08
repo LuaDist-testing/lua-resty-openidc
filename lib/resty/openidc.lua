@@ -51,7 +51,6 @@ local require = require
 local cjson   = require "cjson"
 local cjson_s = require "cjson.safe"
 local http    = require "resty.http"
-local jwt     = require "resty.jwt"
 local string  = string
 local ipairs  = ipairs
 local pairs   = pairs
@@ -66,7 +65,7 @@ local supported_token_auth_methods = {
 }
 
 local openidc = {
-  _VERSION = "1.5.1"
+  _VERSION = "1.5.2"
 }
 openidc.__index = openidc
 
@@ -82,7 +81,7 @@ end
 -- set value in server-wide cache if available
 local function openidc_cache_set(type, key, value, exp)
   local dict = ngx.shared[type]
-  if dict then
+  if dict and (exp > 0) then
     local success, err, forcible = dict:set(key, value, exp)
     ngx.log(ngx.DEBUG, "cache set: success=", success, " err=", err, " forcible=", forcible)
   end
@@ -327,7 +326,8 @@ local function openidc_call_userinfo_endpoint(opts, access_token)
   local httpc = http.new()
   openidc_configure_timeouts(httpc, opts.timeout)
   local res, err = httpc:request_uri(opts.discovery.userinfo_endpoint, {
-    headers = headers
+    headers = headers,
+    ssl_verify = (opts.ssl_verify ~= "no")
   })
   if not res then
     err = "accessing ("..opts.discovery.userinfo_endpoint..") failed: "..err
@@ -568,6 +568,11 @@ local function openidc_pem_from_jwk(opts, kid)
   if err then
     return nil, err
   end
+  
+  if not opts.discovery.jwks_uri or not (type(opts.discovery.jwks_uri) == "string") or (opts.discovery.jwks_uri == "") then
+    return nil, "opts.discovery.jwks_uri is not present or not a string"
+  end
+  
   local cache_id = opts.discovery.jwks_uri .. '#' .. (kid or '')
   local v = openidc_cache_get("jwks", cache_id)
 
@@ -625,6 +630,7 @@ end
 
 -- parse a JWT and verify its signature (if present)
 local function openidc_load_jwt_and_verify_crypto(opts, jwt_string, asymmetric_secret, symmetric_secret, ...)
+  local jwt = require "resty.jwt"
   local enc_hdr, enc_payload, enc_sign = string.match(jwt_string, '^(.+)%.(.+)%.(.*)$')
   if enc_payload and (not enc_sign or enc_sign == "") then
     local jwt = openidc_load_jwt_none_alg(enc_hdr, enc_payload)
@@ -737,7 +743,8 @@ local function openidc_authorization_response(opts, session)
     if is_unsupported_signature_error then
       ngx.log(ngx.WARN, "ignored id_token signature as algorithm '" .. jwt_obj.header.alg .. "' is not supported")
     else
-      ngx.log(ngx.ERR, "id_token '" .. jwt_obj.header.alg .. "' signature verification failed")
+      local alg = (jwt_obj and jwt_obj.header and jwt_obj.header.alg) or ''
+      ngx.log(ngx.ERR, "id_token '" .. alg .. "' signature verification failed")
       return nil, err, session.data.original_url, session
     end
   end
