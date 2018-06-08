@@ -103,6 +103,7 @@ http {
              --redirect_uri_scheme = "https",
              --logout_path = "/logout",
              --redirect_after_logout_uri = "/",
+             --redirect_after_logout_with_id_token_hint = true,
              --token_endpoint_auth_method = ["client_secret_basic"|"client_secret_post"],
              --ssl_verify = "no"
              --access_token_expires_in = 3600
@@ -113,6 +114,8 @@ http {
                 Expiration leeway for access_token renewal.
                 If this is set, renewal will happen access_token_expires_leeway seconds before the token expiration.
                 This avoids errors in case the access_token just expires when arriving to the OAuth Resoource Server.
+             --force_reauthorize = false
+             -- when force_reauthorize is set to true the authorization flow will be executed even if a token has been cached already
           }
 
           -- call authenticate for OpenID Connect user authentication
@@ -137,8 +140,14 @@ http {
           --  ngx.exit(ngx.HTTP_FORBIDDEN)
           --end
 
-          -- set headers with user info (overwriting any existing!)
-          ngx.req.set_header("X-USER", res.id_token.sub)
+          -- set headers with user info: this will overwrite any existing headers but we'll
+          -- also need to scrub it in case no value is provided, to avoid any headers passed
+          -- in by the User-Agent to be interpreted as secure headers set by lua-resty-openidc
+          if res.id_token.sub
+            ngx.req.set_header("X-USER", res.id_token.sub)
+          else
+            ngx.req.clear_header("X-USER")
+          end
       ';
 
       proxy_pass http://localhost:80;
@@ -317,11 +326,7 @@ http {
       access_by_lua '
 
           local opts = {
-             introspection_endpoint="https://localhost:9031/as/token.oauth2",
-             introspection_token_param_name="token",
-             introspection_params = {
-				grant_type="urn:pingidentity.com:oauth2:grant_type:validate_bearer",
-             },
+             introspection_endpoint="https://localhost:9031/as/introspect.oauth2",
              client_id="rs_client",
              client_secret="2Federate",
              ssl_verify = "no",
