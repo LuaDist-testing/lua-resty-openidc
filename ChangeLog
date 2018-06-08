@@ -1,3 +1,42 @@
+11/14/2017
+- release 1.5.0
+
+11/13/2017
+- provided explicit control over whether the access token gets renewed
+  on expiry. If refresh fails, the user is redirected to the OP's
+  authorization endpoint.
+
+11/06/2017
+- added support for configurable network timeouts
+
+11/01/2017
+- now uses cjson.safe when decoding JSON received from external sources for improved error handling
+
+10/30/2017
+- fixed case where openidc.introspect would accept invalid tokens if they contained an exp claim
+
+10/28/2017
+- add id_token_hint when calling end_session_endpoint
+
+10/27/2017
+- ensured id_token_hint uses the correct query string separator when
+  opts.redirect_after_logout_uri is used together with redirect_after_logout_with_id_token_hint
+
+10/24/2017
+- verify RSA signatures on JWTs (id_token/access_token); thanks @venkatmarepalli
+- rely on lua-resty-jwt validators for id_token and/or JWT access_token validation
+- unify JWT access token and OIDC id_token validation
+- added many more tests
+
+10/11/2017
+- add testbed / unit tests; thanks @bodewig
+
+10/05/2017
+- check that sub is always present in the id_token
+- check that sub returned from the userinfo endpoint matches sub in the id_token
+- allow for id_tokens with alg set to "none" and no signature part
+- add more logs
+
 10/03/2017
 - ignore any configured token_endpoint_auth_method that the library doesn't support (and log an error) and
   fall back to the first token_endpoint_auth_methods_supported the library can use; thanks @bodewig

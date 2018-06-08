@@ -49,12 +49,16 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 local require = require
 local cjson   = require "cjson"
+local cjson_s = require "cjson.safe"
 local http    = require "resty.http"
+local jwt     = require "resty.jwt"
 local string  = string
 local ipairs  = ipairs
 local pairs   = pairs
 local type    = type
 local ngx     = ngx
+local b64     = ngx.encode_base64
+local unb64   = ngx.decode_base64
 
 local supported_token_auth_methods = {
    client_secret_basic = true,
@@ -62,7 +66,7 @@ local supported_token_auth_methods = {
 }
 
 local openidc = {
-  _VERSION = "1.4.1"
+  _VERSION = "1.5.0"
 }
 openidc.__index = openidc
 
@@ -88,9 +92,8 @@ end
 local function openidc_cache_get(type, key)
   local dict = ngx.shared[type]
   local value
-  local flags
   if dict then
-    value, flags = dict:get(key)
+    value = dict:get(key)
     if value then ngx.log(ngx.DEBUG, "cache hit: type=", type, " key=", key) end
   end
   return value
@@ -101,13 +104,19 @@ local function openidc_validate_id_token(opts, id_token, nonce)
 
   -- check issuer
   if opts.discovery.issuer ~= id_token.iss then
-    ngx.log(ngx.ERR, "issuer \"", id_token.iss, " in id_token is not equal to the issuer from the discovery document \"", opts.discovery.issuer, "\"")
+    ngx.log(ngx.ERR, "issuer \"", id_token.iss, "\" in id_token is not equal to the issuer from the discovery document \"", opts.discovery.issuer, "\"")
+    return false
+  end
+
+  -- check sub
+  if not id_token.sub then
+    ngx.log(ngx.ERR, "no \"sub\" claim found in id_token")
     return false
   end
 
   -- check nonce
   if nonce and nonce ~= id_token.nonce then
-    ngx.log(ngx.ERR, "nonce \"", id_token.nonce, " in id_token is not equal to the nonce that was sent in the request \"", nonce, "\"")
+    ngx.log(ngx.ERR, "nonce \"", id_token.nonce, "\" in id_token is not equal to the nonce that was sent in the request \"", nonce, "\"")
     return false
   end
 
@@ -119,19 +128,29 @@ local function openidc_validate_id_token(opts, id_token, nonce)
 
   local slack=opts.iat_slack and opts.iat_slack or 120
   if id_token.iat < (ngx.time() - slack) then
-    ngx.log(ngx.ERR, "token is not valid yet: id_token.iat=", id_token.iat, ", ngx.time()=", ngx.time())
+    ngx.log(ngx.ERR, "token has been issued too long ago: id_token.iat=", id_token.iat, ", ngx.time()=", ngx.time())
     return false
   end
 
   -- check expiry timestamp
-  if id_token.exp < ngx.time() then
+  if not id_token.exp then
+    ngx.log(ngx.ERR, "no \"exp\" claim found in id_token")
+    return false
+  end
+
+  if (id_token.exp + slack) < ngx.time() then
     ngx.log(ngx.ERR, "token expired: id_token.exp=", id_token.exp, ", ngx.time()=", ngx.time())
     return false
   end
 
   -- check audience (array or string)
+  if not id_token.aud then
+    ngx.log(ngx.ERR, "no \"aud\" claim found in id_token")
+    return false
+  end
+
   if (type(id_token.aud) == "table") then
-    for key, value in pairs(id_token.aud) do
+    for _, value in pairs(id_token.aud) do
       if value == opts.client_id then
         return true
       end
@@ -165,17 +184,19 @@ local function openidc_base64_url_decode(input)
     input = input .. string.rep('=', padlen)
   end
   input = input:gsub('-','+'):gsub('_','/')
-  return ngx.decode_base64(input)
+  return unb64(input)
 end
 
--- perform base64url encoding
-local function openidc_base64_url_encode(input)
-  input = ngx.encode_base64(input)
-  return input:gsub('+','-'):gsub('/','_'):gsub('=','')
+local function openidc_combine_uri(uri, params)
+  local sep = "?"
+  if string.find(uri, "?", 1, true) then
+    sep = "&"
+  end
+  return uri .. sep .. ngx.encode_args(params)
 end
 
 -- send the browser of to the OP's authorization endpoint
-local function openidc_authorize(opts, session, target_url)
+local function openidc_authorize(opts, session, target_url, prompt)
   local resty_random = require "resty.random"
   local resty_string = require "resty.string"
 
@@ -193,12 +214,12 @@ local function openidc_authorize(opts, session, target_url)
     nonce=nonce,
   }
 
-  if opts.prompt then
-    params.prompt = opts.prompt  
+  if prompt then
+    params.prompt = prompt
   end
 
   if opts.display then
-    params.display = opts.display  
+    params.display = opts.display
   end
 
   -- merge any provided extra parameters
@@ -215,7 +236,7 @@ local function openidc_authorize(opts, session, target_url)
   session:save()
 
   -- redirect to the /authorization endpoint
-  return ngx.redirect(opts.discovery.authorization_endpoint.."?"..ngx.encode_args(params))
+  return ngx.redirect(openidc_combine_uri(opts.discovery.authorization_endpoint, params))
 end
 
 -- parse the JSON result from a call to the OP
@@ -229,7 +250,7 @@ local function openidc_parse_json_response(response)
     err = "response indicates failure, status="..response.status..", body="..response.body
   else
     -- decode the response and extract the JSON object
-    res = cjson.decode(response.body)
+    res = cjson_s.decode(response.body)
 
     if not res then
       err = "JSON decoding failed"
@@ -239,16 +260,27 @@ local function openidc_parse_json_response(response)
   return res, err
 end
 
--- make a call to the token endpoint
-local function openidc_call_token_endpoint(opts, endpoint, body, auth)
+local function openidc_configure_timeouts(httpc, timeout)
+  if timeout then
+    if type(timeout) == "table" then
+      local r, e = httpc:set_timeouts(timeout.connect or 0, timeout.send or 0, timeout.read or 0)
+    else
+      local r, e = httpc:set_timeout(timeout)
+    end
+  end
+end
 
+-- make a call to the token endpoint
+local function openidc_call_token_endpoint(opts, endpoint, body, auth, endpoint_name)
+
+  local ep_name = endpoint_name or 'token'
   local headers = {
       ["Content-Type"] = "application/x-www-form-urlencoded"
   }
 
   if auth then
     if auth == "client_secret_basic" then
-      headers.Authorization = "Basic "..ngx.encode_base64( opts.client_id..":"..opts.client_secret)
+      headers.Authorization = "Basic "..b64( opts.client_id..":"..opts.client_secret)
       ngx.log(ngx.DEBUG,"client_secret_basic: authorization header '"..headers.Authorization.."'")
     end
     if auth == "client_secret_post" then
@@ -258,9 +290,10 @@ local function openidc_call_token_endpoint(opts, endpoint, body, auth)
     end
   end
 
-  ngx.log(ngx.DEBUG, "request body for token endpoint call: ", ngx.encode_args(body))
+  ngx.log(ngx.DEBUG, "request body for "..ep_name.." endpoint call: ", ngx.encode_args(body))
 
   local httpc = http.new()
+  openidc_configure_timeouts(httpc, opts.timeout)
   local res, err = httpc:request_uri(endpoint, {
     method = "POST",
     body = ngx.encode_args(body),
@@ -268,14 +301,14 @@ local function openidc_call_token_endpoint(opts, endpoint, body, auth)
     ssl_verify = (opts.ssl_verify ~= "no")
   })
   if not res then
-    err = "accessing token endpoint ("..endpoint..") failed: "..err
+    err = "accessing "..ep_name.." endpoint ("..endpoint..") failed: "..err
     ngx.log(ngx.ERR, err)
     return nil, err
   end
 
-  ngx.log(ngx.DEBUG, "token endpoint response: ", res.body)
+  ngx.log(ngx.DEBUG, ep_name.." endpoint response: ", res.body)
 
-  return openidc_parse_json_response(res);
+  return openidc_parse_json_response(res)
 end
 
 -- make a call to the userinfo endpoint
@@ -285,15 +318,19 @@ local function openidc_call_userinfo_endpoint(opts, access_token)
     return nil, nil
   end
 
-  local httpc = http.new()
-  local res, err = httpc:request_uri(opts.discovery.userinfo_endpoint, {
-    headers = {
+  local headers = {
       ["Authorization"] = "Bearer "..access_token,
-    }
+  }
+
+  ngx.log(ngx.DEBUG,"authorization header '"..headers.Authorization.."'")
+
+  local httpc = http.new()
+  openidc_configure_timeouts(httpc, opts.timeout)
+  local res, err = httpc:request_uri(opts.discovery.userinfo_endpoint, {
+    headers = headers
   })
   if not res then
-    err = "accessing userinfo endpoint ("..opts.discovery.userinfo_endpoint..") failed: "..err
-    ngx.log(ngx.ERR, err)
+    err = "accessing ("..opts.discovery.userinfo_endpoint..") failed: "..err
     return nil, err
   end
 
@@ -306,6 +343,321 @@ end
 -- computes access_token expires_in value (in seconds)
 local function openidc_access_token_expires_in(opts, expires_in)
   return (expires_in or opts.access_token_expires_in or 3600) - 1 - (opts.access_token_expires_leeway or 0)
+end
+
+local function openidc_load_jwt_none_alg(enc_hdr, enc_payload)
+  local header = cjson_s.decode(openidc_base64_url_decode(enc_hdr))
+  local payload = cjson_s.decode(openidc_base64_url_decode(enc_payload))
+  if header and payload and header.alg == "none" then
+    ngx.log(ngx.DEBUG, "accept JWT with alg \"none\" and no signature from \"code\" flow")
+    return {
+      raw_header = enc_hdr,
+      raw_payload = enc_payload,
+      header = header,
+      payload = payload,
+      signature = ''
+    }
+  end
+  return nil
+end
+
+-- get the Discovery metadata from the specified URL
+local function openidc_discover(url, ssl_verify, timeout)
+  ngx.log(ngx.DEBUG, "openidc_discover: URL is: "..url)
+
+  local json, err
+  local v = openidc_cache_get("discovery", url)
+  if not v then
+
+    ngx.log(ngx.DEBUG, "discovery data not in cache, making call to discovery endpoint")
+    -- make the call to the discovery endpoint
+    local httpc = http.new()
+    openidc_configure_timeouts(httpc, timeout)
+    local res, error = httpc:request_uri(url, {
+      ssl_verify = (ssl_verify ~= "no")
+    })
+    if not res then
+      err = "accessing discovery url ("..url..") failed: "..error
+      ngx.log(ngx.ERR, err)
+    else
+      ngx.log(ngx.DEBUG, "response data: "..res.body)
+      json, err = openidc_parse_json_response(res)
+      if json then
+        if string.sub(url, 1, string.len(json['issuer'])) == json['issuer'] then
+          openidc_cache_set("discovery", url, cjson.encode(json), 24 * 60 * 60)
+        else
+          err = "issuer field in Discovery data does not match URL"
+          ngx.log(ngx.ERR, err)
+          json = nil
+        end
+      else
+        err = "could not decode JSON from Discovery data" .. (err and (": " .. err) or '')
+        ngx.log(ngx.ERR, err)
+      end
+    end
+
+  else
+    json = cjson.decode(v)
+  end
+
+  return json, err
+end
+
+-- turn a discovery url set in the opts dictionary into the discovered information
+local function openidc_ensure_discovered_data(opts)
+  local err
+  if type(opts.discovery) == "string" then
+    opts.discovery, err = openidc_discover(opts.discovery, opts.ssl_verify, opts.timeout)
+  end
+  return err
+end
+
+local function openidc_jwks(url, force, ssl_verify, timeout)
+  ngx.log(ngx.DEBUG, "openidc_jwks: URL is: "..url.. " (force=" .. force .. ")")
+
+  local json, err, v
+
+  if force == 0 then
+    v = openidc_cache_get("jwks", url)
+  end
+
+  if not v then
+
+    ngx.log(ngx.DEBUG, "cannot use cached JWKS data; making call to jwks endpoint")
+    -- make the call to the jwks endpoint
+    local httpc = http.new()
+    openidc_configure_timeouts(httpc, timeout)
+    local res, error = httpc:request_uri(url, {
+      ssl_verify = (ssl_verify ~= "no")
+    })
+    if not res then
+      err = "accessing jwks url ("..url..") failed: "..error
+      ngx.log(ngx.ERR, err)
+    else
+      ngx.log(ngx.DEBUG, "response data: "..res.body)
+      json, err = openidc_parse_json_response(res)
+      if json then
+        openidc_cache_set("jwks", url, cjson.encode(json), 24 * 60 * 60)
+      end
+    end
+
+  else
+    json = cjson.decode(v)
+  end
+
+  return json, err
+end
+
+local function split_by_chunk(text, chunkSize)
+  local s = {}
+  for i=1, #text, chunkSize do
+    s[#s+1] = text:sub(i,i+chunkSize - 1)
+  end
+  return s
+end
+
+local function get_jwk (keys, kid)
+
+  local rsa_keys = {}
+  for _, value in pairs(keys) do
+    if value.kty == "RSA" and (not value.use or value.use == "sig") then
+      table.insert(rsa_keys, value)
+    end
+  end
+
+  if kid == nil then
+    if #rsa_keys == 1 then
+      ngx.log(ngx.DEBUG, "returning only RSA key of JWKS for keyid-less JWT")
+      return rsa_keys[1], nil
+    else
+      return nil, "JWT doesn't specify kid but the keystore contains multiple RSA keys"
+    end
+  end
+  for _, value in pairs(rsa_keys) do
+    if value.kid == kid then
+      return value, nil
+    end
+  end
+
+  return nil, "RSA key with id " .. kid .. " not found"
+end
+
+local wrap = ('.'):rep(64)
+
+local envelope = "-----BEGIN %s-----\n%s\n-----END %s-----\n"
+
+local function der2pem(data, header, typ)
+  typ = typ:upper() or "CERTIFICATE"
+  if header == nil then
+    data = b64(data)
+    return string.format(envelope, typ, data:gsub(wrap, '%0\n', (#data-1)/64), typ)
+  else
+    -- ADDING b64 RSA HEADER WITH OID
+    data = header .. b64(data)
+    return string.format(envelope, typ,  data:gsub(wrap, '%0\n', (#data-1)/64), typ)
+  end
+end
+
+
+local function encode_length(length)
+    if length < 0x80 then
+        return string.char(length)
+    elseif length < 0x100 then
+        return string.char(0x81, length)
+    elseif length < 0x10000 then
+        return string.char(0x82, math.floor(length/0x100), length%0x100)
+    end
+    error("Can't encode lengths over 65535")
+end
+
+
+local function encode_sequence(array, of)
+    local encoded_array = array
+    if of then
+        encoded_array = {}
+        for i = 1, #array do
+            encoded_array[i] = of(array[i])
+        end
+    end
+    encoded_array = table.concat(encoded_array)
+
+    return string.char(0x30) .. encode_length(#encoded_array) .. encoded_array
+end
+
+local function encode_binary_integer(bytes)
+    if bytes:byte(1) > 128 then
+        -- We currenly only use this for unsigned integers,
+        -- however since the high bit is set here, it would look
+        -- like a negative signed int, so prefix with zeroes
+        bytes = "\0" .. bytes
+     end
+     return "\2" .. encode_length(#bytes) .. bytes
+end
+
+local function encode_sequence_of_integer(array)
+  return encode_sequence(array,encode_binary_integer)
+end
+
+local function openidc_pem_from_x5c(x5c)
+  -- TODO check x5c length
+  ngx.log(ngx.DEBUG, "Found x5c, getting PEM public key from x5c entry of json public key")
+  local chunks = split_by_chunk(b64(openidc_base64_url_decode(x5c[1])), 64)
+  local pem = "-----BEGIN CERTIFICATE-----\n" ..
+    table.concat(chunks, "\n") ..
+    "\n-----END CERTIFICATE-----"
+  ngx.log(ngx.DEBUG,"Generated PEM key from x5c:", pem)
+  return pem
+end
+
+local function openidc_pem_from_rsa_n_and_e(n, e)
+  ngx.log(ngx.DEBUG , "getting PEM public key from n and e parameters of json public key")
+
+  local der_key = {
+    openidc_base64_url_decode(n), openidc_base64_url_decode(e)
+  }
+  local encoded_key = encode_sequence_of_integer(der_key)
+
+  --PEM KEY FROM PUBLIC KEYS, PASSING 64 BIT ENCODED RSA HEADER STRING WHICH IS SAME FOR ALL KEYS
+  local pem = der2pem(encoded_key,"MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A","PUBLIC KEY")
+  ngx.log(ngx.DEBUG, "Generated pem key from n and e: ", pem)
+  return pem
+end
+
+local function openidc_pem_from_jwk(opts, kid)
+  local err = openidc_ensure_discovered_data(opts)
+  if err then
+    return nil, err
+  end
+  local cache_id = opts.discovery.jwks_uri .. '#' .. (kid or '')
+  local v = openidc_cache_get("jwks", cache_id)
+
+  if v then
+    return v
+  end
+
+  local jwk, jwks
+
+  for force=0, 1 do
+    jwks, err = openidc_jwks(opts.discovery.jwks_uri, force, opts.ssl_verify, opts.timeout)
+    if err then
+      return nil, err
+    end
+
+    jwk, err = get_jwk(jwks.keys, kid)
+
+    if jwk and not err then
+      break
+    end
+  end
+
+  if err then
+    return nil, err
+  end
+
+  local pem
+  -- TODO check x5c length
+  if jwk.x5c then
+    pem = openidc_pem_from_x5c(jwk.x5c)
+  elseif jwk.kty == "RSA" and jwk.n and jwk.e then
+    pem = openidc_pem_from_rsa_n_and_e(jwk.n, jwk.e)
+  else
+    return nil, "don't know how to create RSA key/cert for " .. cjson.encode(jwt)
+  end
+
+  openidc_cache_set("jwks", cache_id, pem, 24 * 60 * 60)
+  return pem
+end
+
+-- parse a JWT and verify its signature (if present)
+local function openidc_load_jwt_and_verify_crypto(opts, jwt_string, ...)
+  local enc_hdr, enc_payload, enc_sign = string.match(jwt_string, '^(.+)%.(.+)%.(.*)$')
+  if enc_payload and (not enc_sign or enc_sign == "") then
+    local jwt = openidc_load_jwt_none_alg(enc_hdr, enc_payload)
+    if jwt then return jwt end -- otherwise the JWT is invalid and load_jwt produces an error
+  end
+
+  local jwt_obj = jwt:load_jwt(jwt_string, nil)
+  if not jwt_obj.valid then
+    local reason = "invalid jwt"
+    if jwt_obj.reason then
+      reason = reason .. ": " .. jwt_obj.reason
+    end
+    return nil, reason
+  end
+
+  local secret = opts.secret
+  if not secret and opts.discovery then
+    ngx.log(ngx.DEBUG, "using discovery to find key")
+    local err
+    secret, err = openidc_pem_from_jwk(opts, jwt_obj.header.kid)
+
+    if secret == nil then
+      ngx.log(ngx.ERR, err)
+      return nil, err
+    end
+  end
+
+  if #{...} == 0 then
+    -- an empty list of claim specs makes lua-resty-jwt add default
+    -- validators for the exp and nbf claims if they are
+    -- present. These validators need to know the configured slack
+    -- value
+    local jwt_validators = require "resty.jwt-validators"
+    jwt_validators.set_system_leeway(opts.iat_slack and opts.iat_slack or 120)
+  end
+
+  jwt_obj = jwt:verify_jwt_obj(secret, jwt_obj, ...)
+  if jwt_obj then
+    ngx.log(ngx.DEBUG, "jwt: ", cjson.encode(jwt_obj), " ,valid: ", jwt_obj.valid, ", verified: ", jwt_obj.verified)
+  end
+  if not jwt_obj.verified then
+    local reason = "jwt signature verification failed"
+    if jwt_obj.reason then
+      reason = reason .. ": " .. jwt_obj.reason
+    end
+    return nil, reason
+  end
+  return jwt_obj
 end
 
 -- handle a "code" authorization response from the OP
@@ -350,19 +702,26 @@ local function openidc_authorization_response(opts, session)
 
   local current_time = ngx.time()
   -- make the call to the token endpoint
-  local json, err = openidc_call_token_endpoint(opts, opts.discovery.token_endpoint, body, opts.token_endpoint_auth_method)
+  local json
+  json, err = openidc_call_token_endpoint(opts, opts.discovery.token_endpoint, body, opts.token_endpoint_auth_method)
   if err then
     return nil, err, session.data.original_url, session
   end
 
-  -- process the token endpoint response with the id_token and access_token
-  local enc_hdr, enc_pay, enc_sign = string.match(json.id_token, '^(.+)%.(.+)%.(.+)$')
-  local jwt = openidc_base64_url_decode(enc_pay)
-  local id_token = cjson.decode(jwt)
+  local jwt_obj
+  jwt_obj, err = openidc_load_jwt_and_verify_crypto(opts, json.id_token)
+  if err then
+    return nil, err, session.data.original_url, session
+  end
+  local id_token = jwt_obj.payload
+
+  ngx.log(ngx.DEBUG, "id_token header: ", cjson.encode(jwt_obj.header))
+  ngx.log(ngx.DEBUG, "id_token payload: ", cjson.encode(jwt_obj.payload))
 
   -- validate the id_token contents
   if openidc_validate_id_token(opts, id_token, session.data.nonce) == false then
     err = "id_token validation failed"
+    ngx.log(ngx.ERR, err)
     return nil, err, session.data.original_url, session
   end
 
@@ -379,8 +738,19 @@ local function openidc_authorization_response(opts, session)
   if store_in_session(opts, 'user') then
     -- call the user info endpoint
     -- TODO: should this error be checked?
-    local user, err = openidc_call_userinfo_endpoint(opts, json.access_token)
-    session.data.user = user
+    local user
+    user, err = openidc_call_userinfo_endpoint(opts, json.access_token)
+
+    if err then
+      ngx.log(ngx.ERR, "error calling userinfo endpoint: " .. err)
+    elseif user then
+      if id_token.sub ~= user.sub then
+        err = "\"sub\" claim in id_token (\"" .. (id_token.sub or "null") .. "\") is not equal to the \"sub\" claim returned from the userinfo endpoint (\"" .. (user.sub or "null") .. "\")"
+        ngx.log(ngx.ERR, err)
+      else
+        session.data.user = user
+      end
+    end
   end
 
   if store_in_session(opts, 'enc_id_token') then
@@ -405,115 +775,6 @@ local function openidc_authorization_response(opts, session)
 
 end
 
--- get the Discovery metadata from the specified URL
-local function openidc_discover(url, ssl_verify)
-  ngx.log(ngx.DEBUG, "openidc_discover: URL is: "..url)
-
-  local json, err
-  local v = openidc_cache_get("discovery", url)
-  if not v then
-
-    ngx.log(ngx.DEBUG, "discovery data not in cache, making call to discovery endpoint")
-    -- make the call to the discovery endpoint
-    local httpc = http.new()
-    local res, error = httpc:request_uri(url, {
-      ssl_verify = (ssl_verify ~= "no")
-    })
-    if not res then
-      err = "accessing discovery url ("..url..") failed: "..error
-      ngx.log(ngx.ERR, err)
-    else
-      ngx.log(ngx.DEBUG, "response data: "..res.body)
-      json, err = openidc_parse_json_response(res)
-      if json then
-        if string.sub(url, 1, string.len(json['issuer'])) == json['issuer'] then
-          openidc_cache_set("discovery", url, cjson.encode(json), 24 * 60 * 60)
-        else
-          err = "issuer field in Discovery data does not match URL"
-          json = nil
-        end
-      else
-        err = "could not decode JSON from Discovery data"
-      end
-    end
-
-  else
-    json = cjson.decode(v)
-  end
-
-  return json, err
-end
-
-local function openidc_jwks(url, ssl_verify)
-  ngx.log(ngx.DEBUG, "openidc_jwks: URL is: "..url)
-
-  local json, err
-  local v = openidc_cache_get("jwks", url)
-  if not v then
-
-    ngx.log(ngx.DEBUG, "JWKS data not in cache. Making call to jwks endpoint")
-    -- make the call to the jwks endpoint
-    local httpc = http.new()
-    local res, error = httpc:request_uri(url, {
-      ssl_verify = (ssl_verify ~= "no")
-    })
-    if not res then
-      err = "accessing jwks url ("..url..") failed: "..error
-      ngx.log(ngx.ERR, err)
-    else
-      ngx.log(ngx.DEBUG, "response data: "..res.body)
-      json, err = openidc_parse_json_response(res)
-      if json then
-        openidc_cache_set("jwks", url, cjson.encode(json), 24 * 60 * 60)
-      end
-    end
-
-  else
-    json = cjson.decode(v)
-  end
-
-  return json, err
-end
-
-local function split_by_chunk(text, chunkSize)
-  local s = {}
-  for i=1, #text, chunkSize do
-    s[#s+1] = text:sub(i,i+chunkSize - 1)
-  end
-  return s
-end
-
-local function get_jwk (keys, kid)
-  for _, value in pairs(keys) do
-    if value.kid == kid then
-      return value
-    end
-  end
-
-  return nil
-end
-
-local function pem_from_jwk (opts, kid)
-  local cache_id = opts.discovery.jwks_uri .. '#' .. kid
-  local v = openidc_cache_get("jwks", cache_id)
-
-  if v then
-    return v
-  end
-
-  local jwks, err = openidc_jwks(opts.discovery.jwks_uri, opts.ssl_verify)
-  if err then
-    return nil, err
-  end
-
-  local x5c = get_jwk(jwks.keys, kid).x5c
-  -- TODO check x5c length
-  local chunks = split_by_chunk(ngx.encode_base64(openidc_base64_url_decode(x5c[1])), 64)
-  local pem = "-----BEGIN CERTIFICATE-----\n" .. table.concat(chunks, "\n") .. "\n-----END CERTIFICATE-----"
-  openidc_cache_set("jwks", cache_id, pem, 24 * 60 * 60)
-  return pem
-end
-
 local openidc_transparent_pixel = "\137\080\078\071\013\010\026\010\000\000\000\013\073\072\068\082" ..
                                   "\000\000\000\001\000\000\000\001\008\004\000\000\000\181\028\012" ..
                                   "\002\000\000\000\011\073\068\065\084\120\156\099\250\207\000\000" ..
@@ -536,10 +797,12 @@ local function openidc_logout(opts, session)
     ngx.print(openidc_transparent_pixel)
     ngx.exit(ngx.OK)
     return
-  elseif opts.redirect_after_logout_uri and opts.redirect_after_logout_with_id_token_hint then
-    return ngx.redirect(opts.redirect_after_logout_uri.."&id_token_hint="..session_token)
+  elseif opts.redirect_after_logout_uri and opts.redirect_after_logout_with_id_token_hint and session_token then
+    return ngx.redirect(openidc_combine_uri(opts.redirect_after_logout_uri, {id_token_hint=session_token}))
   elseif opts.redirect_after_logout_uri then
     return ngx.redirect(opts.redirect_after_logout_uri)
+  elseif opts.discovery.end_session_endpoint and session_token then
+    return ngx.redirect(openidc_combine_uri(opts.discovery.end_session_endpoint, {id_token_hint=session_token}))
   elseif opts.discovery.end_session_endpoint then
     return ngx.redirect(opts.discovery.end_session_endpoint)
   elseif opts.discovery.ping_end_session_endpoint then
@@ -612,17 +875,15 @@ local function openidc_access_token(opts, session)
     return session.data.access_token, err
   end
   if session.data.refresh_token == nil then
-    return nil, err
+    return nil, "token expired and no refresh token available"
   end
 
   ngx.log(ngx.DEBUG, "refreshing expired access_token: ", session.data.access_token, " with: ", session.data.refresh_token)
 
   -- retrieve token endpoint URL from discovery endpoint if necessary
-  if type(opts.discovery) == "string" then
-    opts.discovery, err = openidc_discover(opts.discovery, opts.ssl_verify)
-    if err then
-      return nil, err
-    end
+  err = openidc_ensure_discovered_data(opts)
+  if err then
+    return nil, err
   end
 
   -- set the authentication method for the token endpoint
@@ -634,7 +895,8 @@ local function openidc_access_token(opts, session)
     scope=opts.scope and opts.scope or "openid email profile"
   }
 
-  local json, err = openidc_call_token_endpoint(opts, opts.discovery.token_endpoint, body, opts.token_endpoint_auth_method)
+  local json
+  json, err = openidc_call_token_endpoint(opts, opts.discovery.token_endpoint, body, opts.token_endpoint_auth_method)
   if err then
     return nil, err
   end
@@ -661,20 +923,13 @@ function openidc.authenticate(opts, target_url, unauth_action, session_opts)
 
   local session = require("resty.session").open(session_opts)
 
-  local target_url = target_url or ngx.var.request_uri
+  target_url = target_url or ngx.var.request_uri
 
   local access_token
 
-  if type(opts.discovery) == "string" then
-    --if session.data.discovery then
-    --  opts.discovery = session.data.discovery
-    --else
-    --  session.data.discovery = opts.discovery
-    --end
-    opts.discovery, err = openidc_discover(opts.discovery, opts.ssl_verify)
-    if err then
-      return nil, err, target_url, session
-    end
+  err = openidc_ensure_discovered_data(opts)
+  if err then
+    return nil, err, target_url, session
   end
 
   -- set the authentication method for the token endpoint
@@ -697,9 +952,29 @@ function openidc.authenticate(opts, target_url, unauth_action, session_opts)
     return nil, nil, target_url, session
   end
 
+  local token_expired = false
+  local try_to_renew = opts.renew_access_token_on_expiry == nil or opts.renew_access_token_on_expiry
+  if try_to_renew and session.present and session.data.authenticated
+    and store_in_session(opts, 'access_token')
+  then
+    -- refresh access_token if necessary
+    access_token, err = openidc_access_token(opts, session)
+    if err then
+      ngx.log(ngx.ERR, "lost access token:" .. err)
+      err = nil
+    end
+    if not access_token then
+      token_expired = true
+    end
+  end
+
   -- if we are not authenticated then redirect to the OP for authentication
   -- the presence of the id_token is check for backwards compatibility
-  if not session.present or not (session.data.id_token or session.data.authenticated) or opts.force_reauthorize then
+  if not session.present
+    or not (session.data.id_token or session.data.authenticated)
+    or opts.force_reauthorize
+    or (try_to_renew and token_expired)
+  then
     if unauth_action == "pass" then
       return
         nil,
@@ -707,24 +982,15 @@ function openidc.authenticate(opts, target_url, unauth_action, session_opts)
         target_url,
         session
     end
-    openidc_authorize(opts, session, target_url)
+    openidc_authorize(opts, session, target_url, opts.prompt)
     return nil, nil, target_url, session
   end
 
   -- silently reauthenticate if necessary (mainly used for session refresh/getting updated id_token data)
   if opts.refresh_session_interval ~= nil then
     if session.data.last_authenticated == nil or (session.data.last_authenticated+opts.refresh_session_interval) < ngx.time() then
-      opts.prompt = "none"
-      openidc_authorize(opts, session, target_url)
+      openidc_authorize(opts, session, target_url, "none")
       return nil, nil, target_url, session
-    end
-  end
-
-  if store_in_session(opts, 'access_token') then
-    -- refresh access_token if necessary
-    access_token, err = openidc_access_token(opts, session)
-    if err then
-      return nil, err, target_url, session
     end
   end
 
@@ -816,22 +1082,24 @@ function openidc.introspect(opts)
 
     -- merge any provided extra parameters
     if opts.introspection_params then
-      for k,v in pairs(opts.introspection_params) do body[k] = v end
+      for key,val in pairs(opts.introspection_params) do body[key] = val end
     end
 
     -- call the introspection endpoint
-    json, err = openidc_call_token_endpoint(opts, opts.introspection_endpoint, body, nil)
-    
+    json, err = openidc_call_token_endpoint(opts, opts.introspection_endpoint, body, nil, "introspection")
+
     -- cache the results
     if json then
-      local expiry_claim = opts.introspection_expiry_claim or "exp"
-      if json.active or json[expiry_claim] then
-        local ttl = json[expiry_claim]        
-        if expiry_claim == "exp" then --https://tools.ietf.org/html/rfc7662#section-2.2
-          ttl = ttl - ngx.time()
+      if json.active then
+        local expiry_claim = opts.introspection_expiry_claim or "exp"
+        if json[expiry_claim] then
+          local ttl = json[expiry_claim]
+          if expiry_claim == "exp" then --https://tools.ietf.org/html/rfc7662#section-2.2
+            ttl = ttl - ngx.time()
+          end
+          ngx.log(ngx.DEBUG, "cache token ttl: "..ttl)
+          openidc_cache_set("introspection", access_token, cjson.encode(json), ttl)
         end
-        ngx.log(ngx.DEBUG, "cache token ttl: "..ttl)
-        openidc_cache_set("introspection", access_token, cjson.encode(json), ttl)
       else
         err = "invalid token"
       end
@@ -850,47 +1118,18 @@ function openidc.jwt_verify(access_token, opts, ...)
   local err
   local json
 
+  local slack = opts.iat_slack and opts.iat_slack or 120
   -- see if we've previously cached the validation result for this access token
   local v = openidc_cache_get("introspection", access_token)
   if not v then
+    local jwt_obj
+    jwt_obj, err = openidc_load_jwt_and_verify_crypto(opts, access_token, ...)
+    if not err then
+      json = jwt_obj.payload
+      ngx.log(ngx.DEBUG, "jwt: ", cjson.encode(json))
 
-    -- do the verification first time
-    local jwt = require "resty.jwt"
-
-    -- No secret given try getting it from the jwks endpoint
-    if not opts.secret and opts.discovery then
-      ngx.log(ngx.DEBUG, "bearer_jwt_verify using discovery.")
-      if type(opts.discovery) == "string" then
-        opts.discovery, err = openidc_discover(opts.discovery, opts.ssl_verify)
-        if err then
-          return nil, err
-        end
-      end
-
-      -- We decode the token twice, could be saved
-      local jwt_obj = jwt:load_jwt(access_token, nil)
-
-      if not jwt_obj.valid then
-        return nil, "invalid jwt"
-      end
-
-      opts.secret, err = pem_from_jwk(opts, jwt_obj.header.kid)
-
-      if opts.secret == nil then
-        return nil, err
-      end
-    end
-
-    json = jwt:verify(opts.secret, access_token, ...)
-
-    ngx.log(ngx.DEBUG, "jwt: ", cjson.encode(json))
-
-    -- cache the results
-    if json and json.valid == true and json.verified == true then
-      json = json.payload
-      openidc_cache_set("introspection", access_token, cjson.encode(json), json.exp - ngx.time())
-    else
-      err = "invalid token: ".. json.reason
+      local ttl = json.exp and json.exp - ngx.time() or 120
+      openidc_cache_set("introspection", access_token, cjson.encode(json), ttl)
     end
 
   else
@@ -898,7 +1137,6 @@ function openidc.jwt_verify(access_token, opts, ...)
     json = cjson.decode(v)
   end
 
-  local slack=opts.iat_slack and opts.iat_slack or 120
   -- check the token expiry
   if json then
     if json.exp and json.exp + slack < ngx.time() then
@@ -911,7 +1149,6 @@ function openidc.jwt_verify(access_token, opts, ...)
 end
 
 function openidc.bearer_jwt_verify(opts, ...)
-  local err
   local json
 
   -- get the access token from the request

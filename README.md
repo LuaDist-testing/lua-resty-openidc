@@ -75,6 +75,8 @@ http {
 
   # cache for discovery metadata documents
   lua_shared_dict discovery 1m;
+  # cache for JWKs
+  lua_shared_dict jwks 1m;
 
   # NB: if you have "lua_code_cache off;", use:
   # set $session_secret xxxxxxxxxxxxxxxxxxx;
@@ -106,9 +108,12 @@ http {
              --redirect_after_logout_with_id_token_hint = true,
              --token_endpoint_auth_method = ["client_secret_basic"|"client_secret_post"],
              --ssl_verify = "no"
+
+             --renew_access_token_on_expiry = true
+             -- whether this plugin shall try to silently renew the access token once it is expired if a refresh token is available.
+             -- if it fails to renew the token, the user will be redirected to the authorization endpoint.
              --access_token_expires_in = 3600
              -- Default lifetime in seconds of the access_token if no expires_in attribute is present in the token endpoint response. 
-             -- This plugin will silently renew the access_token once it is expired if refreshToken scope is present.
 
              --access_token_expires_leeway = 0
              --  Expiration leeway for access_token renewal. If this is set, renewal will happen access_token_expires_leeway seconds before the token expiration. This avoids errors in case the access_token just expires when arriving to the OAuth Resource Server.
@@ -120,6 +125,10 @@ http {
              -- When not set everything will be included in the session.
              -- Available are: 
              -- id_token, enc_id_token, user, access_token (includes refresh token)
+
+             -- You can specify timeouts for connect/send/read as a single number (setting all timeouts) or as a table. Values are in milliseconds
+             -- timeout = 1000
+             -- timeout = { connect = 500, send = 1000, read = 1000 }
           }
 
           -- call authenticate for OpenID Connect user authentication
@@ -305,6 +314,28 @@ http {
   }
 }
 ```
+
+## Running Tests
+
+We've created a dockerized setup for the test in order to simplify the
+installation of dependencies.
+
+In order to run the tests perform
+
+```shell
+$ docker build -f tests/Dockerfile . -t lua-resty-openidc/test
+$ docker run -it --rm lua-resty-openidc/test:latest
+```
+
+if you want to create
+[luacov](https://keplerproject.github.io/luacov/) coverage while
+testing use
+
+```shell
+$ docker run -it --rm -e coverage=t lua-resty-openidc/test:latest
+```
+
+as the second command
 
 ## Support
 
